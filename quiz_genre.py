@@ -10,48 +10,41 @@ import numpy as np
 #  CSV 読み込み（文字コード自動判定つき）
 # =========================================
 def load_csv(path):
+    encodings = ["utf-8", "utf-8-sig", "shift_jis"]
     df = None
 
-    # 1. UTF-8
-    try:
-        df = pd.read_csv(path, encoding="utf-8")
-        print("文字コード: UTF-8")
-    except UnicodeDecodeError:
-        pass
-
-    # 2. UTF-8(BOM)
-    if df is None:
+    for enc in encodings:
         try:
-            df = pd.read_csv(path, encoding="utf-8-sig")
-            print("文字コード: UTF-8(BOM)")
-        except UnicodeDecodeError:
-            pass
+            df = pd.read_csv(path, encoding=enc)
+            print(f"文字コード: {enc}")
+            break
+        except Exception:
+            continue
 
-    # 3. Shift-JIS → UTF-8 に変換
     if df is None:
-        try:
-            df = pd.read_csv(path, encoding="shift_jis")
-            print("文字コード: Shift-JIS → UTF-8 に変換します")
-        except UnicodeDecodeError:
-            print("エラー: 文字コードがUTF-8ではありません")
-            sys.exit(1)
+        print("エラー: 対応していない文字コードです")
+        sys.exit(1)
 
     # ジャンル列の検出
     genre_col = None
     for col in df.columns:
-        if "ジャンル" in col:
+        if "ジャンル" in col or "genre" in col.lower():
             genre_col = col
             break
 
     if genre_col is None:
-        print("エラー: ジャンル列がありません")
+        print("エラー: ジャンル列が見つかりません")
         sys.exit(1)
+
+    # ID が無い場合に自動付与
+    if "ID" not in df.columns:
+        df["ID"] = range(1, len(df) + 1)
 
     return df.to_dict(orient="records"), genre_col
 
 
 # =========================================
-#  評価関数（total は 0 以上）
+#  評価関数（ratio なし・total は 0 以上）
 # =========================================
 eval_cache = {}
 
@@ -59,17 +52,17 @@ def evaluate(sequence, genre_col,
              close_range=5,
              penalty_weight=1000,
              close_weight=500,
-             ratio_weight=200,
              distance_weight=0.1):
 
     key = (
         tuple(item["ID"] for item in sequence),
+        genre_col,
         close_range,
         penalty_weight,
         close_weight,
-        ratio_weight,
         distance_weight,
     )
+
     if key in eval_cache:
         return eval_cache[key]
 
@@ -77,9 +70,9 @@ def evaluate(sequence, genre_col,
     n = len(genres)
 
     # ① 同ジャンル連続
-    penalty = sum(1 for i in range(n - 1) if genres[i] == genres[i + 1])
+    penalty = sum(genres[i] == genres[i + 1] for i in range(n - 1))
 
-    # ② close_range 以内に同ジャンルがあれば罰
+    # ② close_range 以内の同ジャンル
     close_penalty = 0
     for i in range(n):
         for j in range(i + 1, min(i + close_range, n)):
@@ -99,20 +92,13 @@ def evaluate(sequence, genre_col,
             for i in range(m):
                 dist += abs((m - 1 - i) * pos_list[i] - (s - pos_list[i]))
 
-    # ④ ジャンル偏り
-    c = Counter(genres)
-    ratio = max(c.values()) / n
-
-    # ⑤ 距離の最大値（近似）
+    # ④ 最大距離（近似）
     max_distance = n * (n - 1) / 2
-
-    # ★ total（小さいほど良い・0 以上）
     distance_term = max(max_distance - dist, 0)
 
     total = (
         penalty * penalty_weight +
         close_penalty * close_weight +
-        ratio * ratio_weight +
         distance_term * distance_weight
     )
 
@@ -120,7 +106,6 @@ def evaluate(sequence, genre_col,
         "penalty": penalty,
         "close_penalty": close_penalty,
         "distance": dist,
-        "ratio": ratio,
         "total": total,
     }
 
@@ -135,23 +120,12 @@ def is_better(a, b, genre_col, eval_conf):
     ea = evaluate(a, genre_col, **eval_conf)
     eb = evaluate(b, genre_col, **eval_conf)
 
-    # ① total（小さいほど良い）
     if ea["total"] != eb["total"]:
         return ea["total"] < eb["total"]
-
-    # ② penalty（小さいほど良い）
     if ea["penalty"] != eb["penalty"]:
         return ea["penalty"] < eb["penalty"]
-
-    # ③ close_penalty（小さいほど良い）
     if ea["close_penalty"] != eb["close_penalty"]:
         return ea["close_penalty"] < eb["close_penalty"]
-
-    # ④ ratio（小さいほど良い）
-    if ea["ratio"] != eb["ratio"]:
-        return ea["ratio"] < eb["ratio"]
-
-    # ⑤ distance（大きいほど良い）
     return ea["distance"] > eb["distance"]
 
 
@@ -161,6 +135,7 @@ def is_better(a, b, genre_col, eval_conf):
 def init_population(data, size=50):
     return [random.sample(data, len(data)) for _ in range(size)]
 
+
 def tournament_selection(pop, genre_col, eval_conf, k=3):
     best = None
     for _ in range(k):
@@ -169,23 +144,67 @@ def tournament_selection(pop, genre_col, eval_conf, k=3):
             best = indiv
     return best
 
-def crossover(parent1, parent2):
-    size = len(parent1)
+
+# ---------- PMX 交叉（ID ベース） ----------
+def pmx_crossover_ids(parent1_ids, parent2_ids):
+    size = len(parent1_ids)
     a, b = sorted(random.sample(range(size), 2))
     child = [None] * size
-    child[a:b] = parent1[a:b]
-    fill_items = [item for item in parent2 if item not in child]
-    fill_idx = 0
+
+    # 区間コピー
+    child[a:b] = parent1_ids[a:b]
+
+    # マッピング処理
+    for i in range(a, b):
+        val2 = parent2_ids[i]
+        if val2 in child:
+            continue
+        pos = i
+        while True:
+            val1 = parent1_ids[pos]
+            pos = parent2_ids.index(val1)
+            if child[pos] is None:
+                child[pos] = val2
+                break
+
+    # 残りを parent2 から埋める
     for i in range(size):
         if child[i] is None:
-            child[i] = fill_items[fill_idx]
-            fill_idx += 1
+            child[i] = parent2_ids[i]
+
     return child
 
+
+def crossover_pmx(parent1, parent2, id_to_item):
+    p1_ids = [item["ID"] for item in parent1]
+    p2_ids = [item["ID"] for item in parent2]
+    child_ids = pmx_crossover_ids(p1_ids, p2_ids)
+    return [id_to_item[i] for i in child_ids]
+
+
+# ---------- 突然変異（swap / scramble / inversion） ----------
 def mutate(indiv, rate=0.1):
-    if random.random() < rate:
-        i, j = random.sample(range(len(indiv)), 2)
+    if random.random() >= rate:
+        return indiv
+
+    n = len(indiv)
+    op = random.choice(["swap", "scramble", "inversion"])
+
+    if op == "swap":
+        i, j = random.sample(range(n), 2)
         indiv[i], indiv[j] = indiv[j], indiv[i]
+
+    elif op == "scramble":
+        i, j = sorted(random.sample(range(n), 2))
+        segment = indiv[i:j]
+        random.shuffle(segment)
+        indiv[i:j] = segment
+
+    elif op == "inversion":
+        i, j = sorted(random.sample(range(n), 2))
+        segment = list(reversed(indiv[i:j]))
+        indiv[i:j] = segment
+
     return indiv
 
 
@@ -200,40 +219,51 @@ def ensure_output_dir():
 #  最新結果保存
 # =========================================
 def save_latest_results(best, score_dict, gen):
-    pd.DataFrame(best).to_csv("output/result.csv", index=False)
-    with open("output/score.txt", "w", encoding="utf-8") as f:
-        f.write(f"Generation: {gen}\n")
-        for k, v in score_dict.items():
-            f.write(f"{k}: {v}\n")
+    ensure_output_dir()
+    try:
+        pd.DataFrame(best).to_csv("output/result.csv", index=False)
+    except Exception as e:
+        print(f"CSV 保存エラー: {e}")
+
+    try:
+        with open("output/score.txt", "w", encoding="utf-8") as f:
+            f.write(f"Generation: {gen}\n")
+            for k, v in score_dict.items():
+                f.write(f"{k}: {v}\n")
+    except Exception as e:
+        print(f"score.txt 保存エラー: {e}")
 
 
 # =========================================
 #  ヒートマップ
 # =========================================
 def save_heatmap(best, genre_col):
+    ensure_output_dir()
+
     genres = [item[genre_col] for item in best]
     unique = list(sorted(set(genres)))
     mapping = {g: i for i, g in enumerate(unique)}
     arr = np.array([[mapping[g] for g in genres]])
 
     plt.figure(figsize=(18, 2))
-    plt.imshow(arr, cmap="tab20", aspect="auto")
+    plt.imshow(arr, cmap="tab20b", aspect="auto")
     plt.colorbar()
     plt.title("Genre Heatmap")
-    plt.savefig("output/heatmap.png")
+    plt.tight_layout()
+    plt.savefig("output/heatmap.png", dpi=200)
     plt.close()
 
 
 # =========================================
-#  GA メイン
+#  GA メイン（PMX + エリート保存 + 多様性維持）
 # =========================================
 def genetic_algorithm(data, genre_col, generations=50, pop_size=40,
                       mutation_rate=0.1,
                       close_range=5,
                       penalty_weight=1000,
                       close_weight=500,
-                      ratio_weight=200,
-                      distance_weight=0.1):
+                      distance_weight=0.1,
+                      elite_ratio=0.1):
 
     ensure_output_dir()
 
@@ -241,68 +271,89 @@ def genetic_algorithm(data, genre_col, generations=50, pop_size=40,
         close_range=close_range,
         penalty_weight=penalty_weight,
         close_weight=close_weight,
-        ratio_weight=ratio_weight,
         distance_weight=distance_weight,
     )
 
     population = init_population(data, pop_size)
+    id_to_item = {item["ID"]: item for item in data}
 
     global_best = None
+    global_best_score = None
     global_best_gen = 1
 
     scores = []
+    elite_count = max(1, int(pop_size * elite_ratio))
 
     for gen in range(1, generations + 1):
-        new_pop = []
+        # 個体を評価してソート
+        scored_pop = [
+            (indiv, evaluate(indiv, genre_col, **eval_conf))
+            for indiv in population
+        ]
+        scored_pop.sort(key=lambda x: x[1]["total"])
 
-        for _ in range(pop_size):
-            p1 = tournament_selection(population, genre_col, eval_conf)
-            p2 = tournament_selection(population, genre_col, eval_conf)
-            child = mutate(crossover(p1, p2), rate=mutation_rate)
-            new_pop.append(child)
+        # エリート保存
+        elites = [indiv for indiv, _ in scored_pop[:elite_count]]
 
-        population = new_pop
-
-        # ★ best 個体の選択（is_better を使用）
-        best = population[0]
-        for indiv in population[1:]:
-            if is_better(indiv, best, genre_col, eval_conf):
-                best = indiv
-
-        score_dict = evaluate(best, genre_col, **eval_conf)
-        scores.append(score_dict["total"])
+        best = elites[0]
+        best_score = scored_pop[0][1]
+        scores.append(best_score["total"])
 
         print(f"\n=== Generation {gen} ===")
-        print(score_dict)
+        print(best_score)
 
-        # ★ 全世代ベスト更新
         if global_best is None or is_better(best, global_best, genre_col, eval_conf):
             global_best = best
+            global_best_score = best_score
             global_best_gen = gen
 
-        save_latest_results(best, score_dict, gen)
+        new_pop = elites[:]  # エリートをそのまま次世代へ
+
+        # 残りを生成
+        while len(new_pop) < pop_size:
+            p1 = tournament_selection(population, genre_col, eval_conf)
+            p2 = tournament_selection(population, genre_col, eval_conf)
+            child = crossover_pmx(p1, p2, id_to_item)
+            child = mutate(child, rate=mutation_rate)
+            new_pop.append(child)
+
+        # 多様性維持：重複個体の排除
+        unique = {}
+        for indiv in new_pop:
+            key = tuple(item["ID"] for item in indiv)
+            if key not in unique:
+                unique[key] = indiv
+        population = list(unique.values())
+
+        # 個体数が減った場合はランダム個体を追加
+        while len(population) < pop_size:
+            population.append(random.sample(data, len(data)))
+
+        save_latest_results(best, best_score, gen)
 
     # スコア推移グラフ
+    plt.figure(figsize=(10, 4))
     plt.plot(scores)
     plt.xlabel("Generation")
-    plt.ylabel("Total Score (lower is better, best ≒ 0)")
+    plt.ylabel("Total Score (lower is better)")
     plt.title("Score Transition")
-    plt.savefig("output/score_graph.png")
+    plt.tight_layout()
+    plt.savefig("output/score_graph.png", dpi=200)
     plt.close()
 
     # ヒートマップ
     save_heatmap(global_best, genre_col)
 
     print(f"\n=== 全世代で最も total が低かった個体（Generation {global_best_gen}） ===")
-    print(evaluate(global_best, genre_col, **eval_conf))
+    print(global_best_score)
 
-    save_latest_results(global_best, evaluate(global_best, genre_col, **eval_conf), global_best_gen)
+    save_latest_results(global_best, global_best_score, global_best_gen)
 
     return global_best
 
 
 # =========================================
-#  引数パース
+#  引数パース（ratio なし）
 # =========================================
 def parse_args(argv):
     if len(argv) < 2:
@@ -321,30 +372,36 @@ def parse_args(argv):
         "close_range": 5,
         "penalty_weight": 1000,
         "close_weight": 500,
-        "ratio_weight": 200,
         "distance_weight": 0.1,
         "mutation_rate": 0.1,
+        "elite_ratio": 0.1,
     }
+
+    def get_value(argv, idx):
+        if idx + 1 >= len(argv):
+            print(f"エラー: {argv[idx]} の値がありません")
+            sys.exit(1)
+        return argv[idx + 1]
 
     while idx < len(argv):
         arg = argv[idx]
         if arg == "--close-range":
-            params["close_range"] = int(argv[idx + 1])
+            params["close_range"] = int(get_value(argv, idx))
             idx += 2
         elif arg == "--penalty-weight":
-            params["penalty_weight"] = float(argv[idx + 1])
+            params["penalty_weight"] = float(get_value(argv, idx))
             idx += 2
         elif arg == "--close-weight":
-            params["close_weight"] = float(argv[idx + 1])
-            idx += 2
-        elif arg == "--ratio-weight":
-            params["ratio_weight"] = float(argv[idx + 1])
+            params["close_weight"] = float(get_value(argv, idx))
             idx += 2
         elif arg == "--distance-weight":
-            params["distance_weight"] = float(argv[idx + 1])
+            params["distance_weight"] = float(get_value(argv, idx))
             idx += 2
         elif arg == "--mutation-rate":
-            params["mutation_rate"] = float(argv[idx + 1])
+            params["mutation_rate"] = float(get_value(argv, idx))
+            idx += 2
+        elif arg == "--elite-ratio":
+            params["elite_ratio"] = float(get_value(argv, idx))
             idx += 2
         else:
             print(f"不明な引数: {arg}")
@@ -373,8 +430,8 @@ def main():
         close_range=params["close_range"],
         penalty_weight=params["penalty_weight"],
         close_weight=params["close_weight"],
-        ratio_weight=params["ratio_weight"],
         distance_weight=params["distance_weight"],
+        elite_ratio=params["elite_ratio"],
     )
 
     print("\n=== 完了 ===")
