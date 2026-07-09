@@ -1,34 +1,44 @@
-import pandas as pd
+import argparse
+import os
 import random
 import sys
-import os
-from collections import defaultdict, Counter
+from collections import defaultdict
+
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+
 
 # =========================================
 #  CSV 読み込み（文字コード自動判定つき）
 # =========================================
 def load_csv(path):
-    encodings = ["utf-8", "utf-8-sig", "shift_jis"]
+    encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis"]
     df = None
+    last_error = None
 
     for enc in encodings:
         try:
             df = pd.read_csv(path, encoding=enc)
             print(f"文字コード: {enc}")
             break
-        except Exception:
-            continue
+        except Exception as e:
+            last_error = e
 
     if df is None:
         print("エラー: 対応していない文字コードです")
+        if last_error is not None:
+            print(f"詳細: {last_error}")
+        sys.exit(1)
+
+    if df.empty:
+        print("エラー: CSV にデータがありません")
         sys.exit(1)
 
     # ジャンル列の検出
     genre_col = None
     for col in df.columns:
-        if "ジャンル" in col or "genre" in col.lower():
+        if "ジャンル" in str(col) or "genre" in str(col).lower():
             genre_col = col
             break
 
@@ -36,31 +46,55 @@ def load_csv(path):
         print("エラー: ジャンル列が見つかりません")
         sys.exit(1)
 
-    # ID が無い場合に自動付与
-    if "ID" not in df.columns:
+    # ジャンル欠損対策
+    if df[genre_col].isna().any():
+        print("エラー: ジャンル列に空欄があります")
+        sys.exit(1)
+    df[genre_col] = df[genre_col].astype(str)
+
+    # ID が無い場合に自動付与。ID が重複する場合も内部用 ID を付与する。
+    if "ID" not in df.columns or df["ID"].duplicated().any() or df["ID"].isna().any():
+        if "ID" in df.columns:
+            print("警告: ID が重複または空欄のため、内部 ID を自動付与します")
         df["ID"] = range(1, len(df) + 1)
 
     return df.to_dict(orient="records"), genre_col
 
 
 # =========================================
-#  評価関数（ratio なし・total は 0 以上）
+#  評価関数（total は 0 以上）
 # =========================================
 eval_cache = {}
+
+
+def clear_eval_cache_if_needed(max_size=200000):
+    """長時間実行時のメモリ肥大化を抑える。"""
+    if len(eval_cache) > max_size:
+        eval_cache.clear()
+
+
+def pairwise_distance_sum(pos_list):
+    """同一ジャンルの出現位置について、全ペア間距離の総和を返す。"""
+    total = 0
+    prefix = 0
+    for i, pos in enumerate(pos_list):
+        total += i * pos - prefix
+        prefix += pos
+    return total
+
 
 def evaluate(sequence, genre_col,
              close_range=5,
              penalty_weight=1000,
              close_weight=500,
              distance_weight=0.1):
-
     key = (
         tuple(item["ID"] for item in sequence),
         genre_col,
-        close_range,
-        penalty_weight,
-        close_weight,
-        distance_weight,
+        int(close_range),
+        float(penalty_weight),
+        float(close_weight),
+        float(distance_weight),
     )
 
     if key in eval_cache:
@@ -69,32 +103,32 @@ def evaluate(sequence, genre_col,
     genres = [item[genre_col] for item in sequence]
     n = len(genres)
 
-    # ① 同ジャンル連続
+    # 1. 同ジャンル連続
     penalty = sum(genres[i] == genres[i + 1] for i in range(n - 1))
 
-    # ② close_range 以内の同ジャンル
+    # 2. close_range 問以内の同ジャンル
+    # 例: close_range=5 の場合、現在位置から 5 問先までを確認する。
     close_penalty = 0
+    search_range = max(0, int(close_range))
     for i in range(n):
-        for j in range(i + 1, min(i + close_range, n)):
+        for j in range(i + 1, min(i + search_range + 1, n)):
             if genres[i] == genres[j]:
                 close_penalty += 1
 
-    # ③ 距離スコア
+    # 3. 距離スコア（同一ジャンル同士の全ペア距離の総和）
     positions = defaultdict(list)
     for idx, g in enumerate(genres):
         positions[g].append(idx)
 
-    dist = 0
+    distance = 0
     for pos_list in positions.values():
-        m = len(pos_list)
-        if m > 1:
-            s = sum(pos_list)
-            for i in range(m):
-                dist += abs((m - 1 - i) * pos_list[i] - (s - pos_list[i]))
+        if len(pos_list) > 1:
+            distance += pairwise_distance_sum(pos_list)
 
-    # ④ 最大距離（近似）
+    # 4. 最大距離の近似値。
+    # total が負にならないように distance_term は 0 以上に丸める。
     max_distance = n * (n - 1) / 2
-    distance_term = max(max_distance - dist, 0)
+    distance_term = max(max_distance - distance, 0)
 
     total = (
         penalty * penalty_weight +
@@ -103,30 +137,27 @@ def evaluate(sequence, genre_col,
     )
 
     result = {
-        "penalty": penalty,
-        "close_penalty": close_penalty,
-        "distance": dist,
-        "total": total,
+        "penalty": int(penalty),
+        "close_penalty": int(close_penalty),
+        "distance": float(distance),
+        "total": float(total),
     }
 
     eval_cache[key] = result
+    clear_eval_cache_if_needed()
     return result
 
 
 # =========================================
 #  個体比較（total 同値時の優先順位つき）
 # =========================================
-def is_better(a, b, genre_col, eval_conf):
-    ea = evaluate(a, genre_col, **eval_conf)
-    eb = evaluate(b, genre_col, **eval_conf)
+def score_key(indiv, genre_col, eval_conf):
+    e = evaluate(indiv, genre_col, **eval_conf)
+    return (e["total"], e["penalty"], e["close_penalty"], -e["distance"])
 
-    if ea["total"] != eb["total"]:
-        return ea["total"] < eb["total"]
-    if ea["penalty"] != eb["penalty"]:
-        return ea["penalty"] < eb["penalty"]
-    if ea["close_penalty"] != eb["close_penalty"]:
-        return ea["close_penalty"] < eb["close_penalty"]
-    return ea["distance"] > eb["distance"]
+
+def is_better(a, b, genre_col, eval_conf):
+    return score_key(a, genre_col, eval_conf) < score_key(b, genre_col, eval_conf)
 
 
 # =========================================
@@ -137,37 +168,41 @@ def init_population(data, size=50):
 
 
 def tournament_selection(pop, genre_col, eval_conf, k=3):
-    best = None
-    for _ in range(k):
-        indiv = random.choice(pop)
-        if best is None or is_better(indiv, best, genre_col, eval_conf):
-            best = indiv
-    return best
+    k = min(k, len(pop))
+    candidates = random.sample(pop, k)
+    return min(candidates, key=lambda indiv: score_key(indiv, genre_col, eval_conf))
 
 
 # ---------- PMX 交叉（ID ベース） ----------
 def pmx_crossover_ids(parent1_ids, parent2_ids):
     size = len(parent1_ids)
-    a, b = sorted(random.sample(range(size), 2))
-    child = [None] * size
 
-    # 区間コピー
+    if size < 2:
+        return parent1_ids[:]
+
+    a, b = sorted(random.sample(range(size), 2))
+    # b を含めない区間だと 1 要素だけになることがあるため、Python のスライス用に +1 する。
+    b += 1
+
+    child = [None] * size
     child[a:b] = parent1_ids[a:b]
 
-    # マッピング処理
+    # index を毎回探すと遅いため辞書化
+    p2_index = {v: i for i, v in enumerate(parent2_ids)}
+
     for i in range(a, b):
         val2 = parent2_ids[i]
         if val2 in child:
             continue
+
         pos = i
         while True:
             val1 = parent1_ids[pos]
-            pos = parent2_ids.index(val1)
+            pos = p2_index[val1]
             if child[pos] is None:
                 child[pos] = val2
                 break
 
-    # 残りを parent2 から埋める
     for i in range(size):
         if child[i] is None:
             child[i] = parent2_ids[i]
@@ -188,6 +223,9 @@ def mutate(indiv, rate=0.1):
         return indiv
 
     n = len(indiv)
+    if n < 2:
+        return indiv
+
     op = random.choice(["swap", "scramble", "inversion"])
 
     if op == "swap":
@@ -196,32 +234,30 @@ def mutate(indiv, rate=0.1):
 
     elif op == "scramble":
         i, j = sorted(random.sample(range(n), 2))
+        j += 1
         segment = indiv[i:j]
         random.shuffle(segment)
         indiv[i:j] = segment
 
     elif op == "inversion":
         i, j = sorted(random.sample(range(n), 2))
-        segment = list(reversed(indiv[i:j]))
-        indiv[i:j] = segment
+        j += 1
+        indiv[i:j] = reversed(indiv[i:j])
 
     return indiv
 
 
 # =========================================
-#  出力フォルダ
+#  出力
 # =========================================
 def ensure_output_dir():
     os.makedirs("output", exist_ok=True)
 
 
-# =========================================
-#  最新結果保存
-# =========================================
 def save_latest_results(best, score_dict, gen):
     ensure_output_dir()
     try:
-        pd.DataFrame(best).to_csv("output/result.csv", index=False)
+        pd.DataFrame(best).to_csv("output/result.csv", index=False, encoding="utf-8-sig")
     except Exception as e:
         print(f"CSV 保存エラー: {e}")
 
@@ -234,28 +270,28 @@ def save_latest_results(best, score_dict, gen):
         print(f"score.txt 保存エラー: {e}")
 
 
-# =========================================
-#  ヒートマップ
-# =========================================
 def save_heatmap(best, genre_col):
     ensure_output_dir()
 
     genres = [item[genre_col] for item in best]
-    unique = list(sorted(set(genres)))
+    unique = sorted(set(genres))
     mapping = {g: i for i, g in enumerate(unique)}
     arr = np.array([[mapping[g] for g in genres]])
 
     plt.figure(figsize=(18, 2))
     plt.imshow(arr, cmap="tab20b", aspect="auto")
-    plt.colorbar()
+    cbar = plt.colorbar(ticks=list(mapping.values()))
+    cbar.ax.set_yticklabels(unique)
     plt.title("Genre Heatmap")
+    plt.xlabel("Question Order")
+    plt.yticks([])
     plt.tight_layout()
     plt.savefig("output/heatmap.png", dpi=200)
     plt.close()
 
 
 # =========================================
-#  GA メイン（PMX + エリート保存 + 多様性維持）
+#  GA メイン
 # =========================================
 def genetic_algorithm(data, genre_col, generations=50, pop_size=40,
                       mutation_rate=0.1,
@@ -263,9 +299,22 @@ def genetic_algorithm(data, genre_col, generations=50, pop_size=40,
                       penalty_weight=1000,
                       close_weight=500,
                       distance_weight=0.1,
-                      elite_ratio=0.1):
-
+                      elite_ratio=0.1,
+                      seed=None):
     ensure_output_dir()
+
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+    if not data:
+        print("エラー: データがありません")
+        sys.exit(1)
+
+    pop_size = max(2, int(pop_size))
+    generations = max(1, int(generations))
+    elite_ratio = min(max(float(elite_ratio), 0.0), 1.0)
+    mutation_rate = min(max(float(mutation_rate), 0.0), 1.0)
 
     eval_conf = dict(
         close_range=close_range,
@@ -285,15 +334,10 @@ def genetic_algorithm(data, genre_col, generations=50, pop_size=40,
     elite_count = max(1, int(pop_size * elite_ratio))
 
     for gen in range(1, generations + 1):
-        # 個体を評価してソート
-        scored_pop = [
-            (indiv, evaluate(indiv, genre_col, **eval_conf))
-            for indiv in population
-        ]
-        scored_pop.sort(key=lambda x: x[1]["total"])
+        scored_pop = [(indiv, evaluate(indiv, genre_col, **eval_conf)) for indiv in population]
+        scored_pop.sort(key=lambda x: (x[1]["total"], x[1]["penalty"], x[1]["close_penalty"], -x[1]["distance"]))
 
-        # エリート保存
-        elites = [indiv for indiv, _ in scored_pop[:elite_count]]
+        elites = [indiv[:] for indiv, _ in scored_pop[:elite_count]]
 
         best = elites[0]
         best_score = scored_pop[0][1]
@@ -303,13 +347,12 @@ def genetic_algorithm(data, genre_col, generations=50, pop_size=40,
         print(best_score)
 
         if global_best is None or is_better(best, global_best, genre_col, eval_conf):
-            global_best = best
-            global_best_score = best_score
+            global_best = best[:]
+            global_best_score = best_score.copy()
             global_best_gen = gen
 
-        new_pop = elites[:]  # エリートをそのまま次世代へ
+        new_pop = elites[:]
 
-        # 残りを生成
         while len(new_pop) < pop_size:
             p1 = tournament_selection(population, genre_col, eval_conf)
             p2 = tournament_selection(population, genre_col, eval_conf)
@@ -317,7 +360,6 @@ def genetic_algorithm(data, genre_col, generations=50, pop_size=40,
             child = mutate(child, rate=mutation_rate)
             new_pop.append(child)
 
-        # 多様性維持：重複個体の排除
         unique = {}
         for indiv in new_pop:
             key = tuple(item["ID"] for item in indiv)
@@ -325,15 +367,13 @@ def genetic_algorithm(data, genre_col, generations=50, pop_size=40,
                 unique[key] = indiv
         population = list(unique.values())
 
-        # 個体数が減った場合はランダム個体を追加
         while len(population) < pop_size:
             population.append(random.sample(data, len(data)))
 
         save_latest_results(best, best_score, gen)
 
-    # スコア推移グラフ
     plt.figure(figsize=(10, 4))
-    plt.plot(scores)
+    plt.plot(range(1, len(scores) + 1), scores)
     plt.xlabel("Generation")
     plt.ylabel("Total Score (lower is better)")
     plt.title("Score Transition")
@@ -341,7 +381,6 @@ def genetic_algorithm(data, genre_col, generations=50, pop_size=40,
     plt.savefig("output/score_graph.png", dpi=200)
     plt.close()
 
-    # ヒートマップ
     save_heatmap(global_best, genre_col)
 
     print(f"\n=== 全世代で最も total が低かった個体（Generation {global_best_gen}） ===")
@@ -353,68 +392,42 @@ def genetic_algorithm(data, genre_col, generations=50, pop_size=40,
 
 
 # =========================================
-#  引数パース（ratio なし）
+#  引数パース
 # =========================================
-def parse_args(argv):
-    if len(argv) < 2:
-        print("Usage: python quiz_genre.py input.csv [generations] [options]")
-        sys.exit(1)
-
-    input_csv = argv[1]
-    idx = 2
-
-    generations = 50
-    if idx < len(argv) and argv[idx].isdigit():
-        generations = int(argv[idx])
-        idx += 1
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="ジャンルの偏りが少ないクイズ問題の並び順を GA で探索します。"
+    )
+    parser.add_argument("input_csv", help="入力 CSV ファイル")
+    parser.add_argument("generations", nargs="?", type=int, default=50, help="世代数")
+    parser.add_argument("--close-range", type=int, default=5, help="何問以内の同ジャンルを近距離とみなすか")
+    parser.add_argument("--penalty-weight", type=float, default=1000, help="連続ペナルティの重み")
+    parser.add_argument("--close-weight", type=float, default=500, help="近距離ペナルティの重み")
+    parser.add_argument("--distance-weight", type=float, default=0.1, help="距離スコアの重み")
+    parser.add_argument("--mutation-rate", type=float, default=0.1, help="突然変異率")
+    parser.add_argument("--elite-ratio", type=float, default=0.1, help="エリート保存率")
+    parser.add_argument("--pop-size", type=int, default=40, help="個体数")
+    parser.add_argument("--seed", type=int, default=None, help="乱数シード")
+    args = parser.parse_args(argv)
 
     params = {
-        "close_range": 5,
-        "penalty_weight": 1000,
-        "close_weight": 500,
-        "distance_weight": 0.1,
-        "mutation_rate": 0.1,
-        "elite_ratio": 0.1,
+        "close_range": args.close_range,
+        "penalty_weight": args.penalty_weight,
+        "close_weight": args.close_weight,
+        "distance_weight": args.distance_weight,
+        "mutation_rate": args.mutation_rate,
+        "elite_ratio": args.elite_ratio,
+        "pop_size": args.pop_size,
+        "seed": args.seed,
     }
-
-    def get_value(argv, idx):
-        if idx + 1 >= len(argv):
-            print(f"エラー: {argv[idx]} の値がありません")
-            sys.exit(1)
-        return argv[idx + 1]
-
-    while idx < len(argv):
-        arg = argv[idx]
-        if arg == "--close-range":
-            params["close_range"] = int(get_value(argv, idx))
-            idx += 2
-        elif arg == "--penalty-weight":
-            params["penalty_weight"] = float(get_value(argv, idx))
-            idx += 2
-        elif arg == "--close-weight":
-            params["close_weight"] = float(get_value(argv, idx))
-            idx += 2
-        elif arg == "--distance-weight":
-            params["distance_weight"] = float(get_value(argv, idx))
-            idx += 2
-        elif arg == "--mutation-rate":
-            params["mutation_rate"] = float(get_value(argv, idx))
-            idx += 2
-        elif arg == "--elite-ratio":
-            params["elite_ratio"] = float(get_value(argv, idx))
-            idx += 2
-        else:
-            print(f"不明な引数: {arg}")
-            sys.exit(1)
-
-    return input_csv, generations, params
+    return args.input_csv, args.generations, params
 
 
 # =========================================
 #  メイン
 # =========================================
 def main():
-    input_csv, generations, params = parse_args(sys.argv)
+    input_csv, generations, params = parse_args()
 
     print(f"世代数: {generations}")
     print("評価パラメータ:", params)
@@ -425,13 +438,14 @@ def main():
         data,
         genre_col,
         generations=generations,
-        pop_size=40,
+        pop_size=params["pop_size"],
         mutation_rate=params["mutation_rate"],
         close_range=params["close_range"],
         penalty_weight=params["penalty_weight"],
         close_weight=params["close_weight"],
         distance_weight=params["distance_weight"],
         elite_ratio=params["elite_ratio"],
+        seed=params["seed"],
     )
 
     print("\n=== 完了 ===")
