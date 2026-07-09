@@ -85,9 +85,12 @@ total は **0 以上** で、
 
 ```text
 total =
-    penalty_consecutive * penalty_weight
+    penalty * penalty_weight
   + close_penalty * close_weight
-  + (max_distance - distance_score) * distance_weight
+  + distance_term * distance_weight
+
+distance_term =
+    max(max_distance - distance, 0)
 ```
 
 ---
@@ -104,8 +107,8 @@ close_range（例：5問）以内に同じジャンルが出た回数。
 
 ### distance（距離スコア）
 
-同じジャンル同士がどれだけ離れているかの総和。  
-大きいほど良い。
+同一ジャンル同士の全組み合わせについて、出現位置の距離を合計した値。
+大きいほどジャンルが分散していることを表す。
 
 ---
 
@@ -173,12 +176,14 @@ close_range（例：5問）以内に同じジャンルが出た回数。
 
 | パラメータ          | 説明                       | デフォルト |
 | ------------------- | -------------------------- | ---------- |
-| `--close-range`     | 何問以内に同ジャンル禁止か | 5          |
-| `--penalty-weight`  | 連続ペナルティの重み       | 1000       |
-| `--close-weight`    | 近距離ペナルティの重み     | 500        |
-| `--distance-weight` | 距離スコアの重み           | 0.1        |
-| `--mutation-rate`   | 突然変異率                 | 0.1        |
-| `--elite-ratio`     | エリート保存の割合         | 0.1        |
+| `--close-range`     | 何問以内に同ジャンル禁止か   | 5           |
+| `--penalty-weight`  | 連続ペナルティの重み         | 1000       |
+| `--close-weight`    | 近距離ペナルティの重み       | 500        |
+| `--distance-weight` | 距離スコアの重み            | 0.1        |
+| `--mutation-rate`   | 突然変異率                  | 0.1        |
+| `--elite-ratio`     | エリート保存の割合          | 0.1        |
+| `--pop-size`        | 個体数                     | 40         |
+| `--seed`            | 乱数シード（再現性確保）     | ランダム   |
 
 ---
 
@@ -237,6 +242,17 @@ python quiz_genre.py input.csv 300 --mutation-rate 0.3
 python quiz_genre.py input.csv 300 --elite-ratio 0.2
 ```
 
+## 再現性を持たせる
+
+```bash
+python quiz_genre.py input.csv 300 --seed 12345
+```
+
+## 個体数を増やす
+
+```bash
+python quiz_genre.py input.csv 300 --pop-size 100
+```
 ---
 
 # 📡 フォルダ構成例
@@ -263,6 +279,14 @@ CSV が UTF-8 / UTF-8(BOM) / Shift-JIS のいずれでも読み込めない場�
 ### エラー: ジャンル列がありません
 
 列名に「ジャンル」を含む列が存在しない場合。
+
+### エラー: ジャンル列に空欄があります
+
+ジャンル列に空セルが存在する場合。
+
+### 警告: ID が重複または空欄のため、内部 ID を自動付与します
+
+ID列が重複または空欄の場合に表示されます。処理は継続されます。
 
 ---
 
